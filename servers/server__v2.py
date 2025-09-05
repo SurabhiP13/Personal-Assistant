@@ -77,7 +77,9 @@ class GmailTool:
                 flow = InstalledAppFlow.from_client_secrets_file(
                     "credentials.json", SCOPES
                 )
-                creds = flow.run_local_server(port=8080, access_type="offline")
+                creds = flow.run_local_server(
+                    port=8080, access_type="offline", prompt="consent"
+                )
 
             with open("token.json", "w") as token:
                 token.write(creds.to_json())
@@ -167,7 +169,7 @@ class GmailTool:
         if not self.service:
             self.auth()
 
-        self.service.users().messages().delete(userId="me", id=message_id).execute()
+        self.service.users().messages().trash(userId="me", id=message_id).execute()
         return {"status": "deleted", "id": message_id}
 
     def send_email(self, to, subject, body):
@@ -188,6 +190,100 @@ class GmailTool:
             .execute()
         )
         return send_result
+
+    def delete_emails_in_label(self, label_name):
+        """Delete all emails under a given label in batch"""
+        if not self.service:
+            self.auth()
+
+        # 1. Find label ID
+        labels = (
+            self.service.users().labels().list(userId="me").execute().get("labels", [])
+        )
+        label_id = next(
+            (l["id"] for l in labels if l["name"].lower() == label_name.lower()), None
+        )
+
+        if not label_id:
+            return {"error": f"Label '{label_name}' not found"}
+
+        # 2. Get messages under that label
+        results = (
+            self.service.users()
+            .messages()
+            .list(userId="me", labelIds=[label_id])
+            .execute()
+        )
+        messages = results.get("messages", [])
+
+        if not messages:
+            return {"status": "no emails found under this label"}
+
+        # 3. Batch move all messages to Trash
+        message_ids = [m["id"] for m in messages]
+        self.service.users().messages().batchModify(
+            userId="me",
+            body={
+                "ids": message_ids,
+                "removeLabelIds": [],
+                "addLabelIds": ["TRASH"],
+            },
+        ).execute()
+
+        return {"status": "deleted", "count": len(message_ids), "label": label_name}
+
+    # ========================
+    # LABEL MANAGEMENT
+    # ========================
+    def list_labels(self):
+        if not self.service:
+            self.auth()
+        return (
+            self.service.users().labels().list(userId="me").execute().get("labels", [])
+        )
+
+    def create_label(
+        self, name, label_list_visibility="labelShow", message_list_visibility="show"
+    ):
+        if not self.service:
+            self.auth()
+        label_obj = {
+            "name": name,
+            "labelListVisibility": label_list_visibility,
+            "messageListVisibility": message_list_visibility,
+        }
+        return (
+            self.service.users().labels().create(userId="me", body=label_obj).execute()
+        )
+
+    def update_label(
+        self,
+        label_id,
+        new_name=None,
+        label_list_visibility=None,
+        message_list_visibility=None,
+    ):
+        if not self.service:
+            self.auth()
+        label_obj = {}
+        if new_name:
+            label_obj["name"] = new_name
+        if label_list_visibility:
+            label_obj["labelListVisibility"] = label_list_visibility
+        if message_list_visibility:
+            label_obj["messageListVisibility"] = message_list_visibility
+        return (
+            self.service.users()
+            .labels()
+            .update(userId="me", id=label_id, body=label_obj)
+            .execute()
+        )
+
+    def delete_label(self, label_id):
+        if not self.service:
+            self.auth()
+        self.service.users().labels().delete(userId="me", id=label_id).execute()
+        return {"status": "deleted", "id": label_id}
 
 
 gmail = GmailTool()
@@ -241,6 +337,63 @@ def delete_email(message_id: str) -> str:
         return json.dumps(result, indent=2)
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+@mcp.tool()
+def delete_emails_in_label(label_name: str) -> str:
+    """Delete all emails under a specific Gmail label"""
+    try:
+        result = gmail.delete_emails_in_label(label_name)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# ===== LABELS =====
+@mcp.tool("gmail.list_labels")
+def list_labels():
+    return gmail.list_labels()
+
+
+@mcp.tool("gmail.create_label")
+def create_label(name: str):
+    return gmail.create_label(name)
+
+
+@mcp.tool("gmail.update_label")
+def update_label(label_id: str, new_name: str = None):
+    return gmail.update_label(label_id, new_name=new_name)
+
+
+@mcp.tool("gmail.delete_label")
+def delete_label(label_id: str):
+    return gmail.delete_label(label_id)
+
+
+@mcp.tool("gmail.delete_emails_in_label")
+def delete_emails_in_label(label_name: str):
+    return gmail.delete_emails_in_label(label_name)
+
+
+# ===== DRAFTS =====
+@mcp.tool("gmail.list_drafts")
+def list_drafts():
+    return gmail.list_drafts()
+
+
+@mcp.tool("gmail.get_draft")
+def get_draft(draft_id: str):
+    return gmail.get_draft(draft_id)
+
+
+@mcp.tool("gmail.create_draft")
+def create_draft(to: str, subject: str, body: str):
+    return gmail.create_draft(to, subject, body)
+
+
+@mcp.tool("gmail.update_draft")
+def update_draft(draft_id: str, to: str = None, subject: str = None, body: str = None):
+    return gmail.update_draft(draft_id, to=to, subject=subject, body=body)
 
 
 # ============================================================

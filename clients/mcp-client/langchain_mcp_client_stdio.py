@@ -33,6 +33,9 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.prebuilt import create_react_agent
 
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+
+from openai import OpenAI
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain.agents.agent import AgentExecutor
 from langchain.memory import ConversationSummaryBufferMemory
@@ -64,20 +67,19 @@ llm = ChatGoogleGenerativeAI(
 )
 
 mcp_client = None
-
-# ---------------------------
+# ----------------------------
 # Creating memory object
 # ---------------------------
 
 memory = ConversationSummaryBufferMemory(
-    llm=llm,  # the same Gemini model you’re already using
+    llm=llm,  # the gemini model
     return_messages=True,  # ensures messages are stored as AI/HumanMessage objects
     max_token_limit=1000,  # how much history to keep before summarizing
 )
-history = [SystemMessage(content="You are a helpful assistant connected to MCP tools.")]
-# -----------------------------------------------------------------
-# Replacement for load_mcp_tools (compatible with new MCP client)
-# -----------------------------------------------------------------
+history = [
+    SystemMessage(content="You are a helpful assistant connected to MCP tools.")
+]  # not used anywhere?
+
 from langchain.tools import StructuredTool
 from typing import Dict, Any
 
@@ -89,40 +91,46 @@ async def run_agent():
             await session.initialize()
             mcp_client = type("MCPClientHolder", (), {"session": session})()
             tools = await load_mcp_tools(session)
-            # memory = ConversationBufferMemory(return_messages=True)  # creates memory
+            # memory = ConversationBufferMemory(return_messages=True)  # creates memory (will contain dict; humanmessage: aimessage:)
 
             agent = create_react_agent(llm, tools)  # define agent promp
 
             print("MCP Client (SSE) Started! Type 'quit' to exit.")
+            memory.chat_memory.add_message(
+                SystemMessage(
+                    content="You are a helpful assistant connected to MCP tools."  # make this more elaborate (list all tools)
+                )
+            )
             while True:
                 query = input("\nQuery: ").strip()
                 if query.lower() == "quit":
                     break
 
-                # Add user message to memory
-                memory.chat_memory.add_message(HumanMessage(content=query))
+                # Add new user message/query to memory
+                memory.chat_memory.add_message(
+                    HumanMessage(content=query)
+                )  # adding the new user query to our memory
 
                 # Retrieve context (past messages + summary if long)
                 past_messages = memory.load_memory_variables({})["history"]
 
                 # Run agent with history
                 response = await agent.ainvoke(
-                    {
-                        "messages": [
-                            SystemMessage(content="You are a helpful assistant.")
-                        ]
-                        + past_messages
-                        + [HumanMessage(content=query)]
-                    }
+                    {"messages": past_messages + [HumanMessage(content=query)]}
                 )
 
-                memory.chat_memory.add_message(AIMessage(content=str(response)))
+                memory.chat_memory.add_message(
+                    AIMessage(content=str(response))
+                )  # adding the ai response to the memory
                 try:
                     formatted = json.dumps(response, indent=2, cls=CustomEncoder)
                 except Exception:
                     formatted = str(response)
                 print("\nResponse:")
                 print(formatted)
+                # following is for checking the structure in which the memory is getting saved
+                # for msg in past_messages:
+                #     print(f"{msg.__class__.__name__}:")
 
 
 if __name__ == "__main__":
