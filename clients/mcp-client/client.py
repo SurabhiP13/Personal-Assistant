@@ -28,6 +28,12 @@ class MCPClient:
         self.session: Optional[ClientSession] = None  # MCP session for communication
         self.exit_stack = AsyncExitStack()  # Manages async resource cleanup
 
+        # Conversation history (list of types.Content) so multi-turn chats
+        # have context. Populated by process_query, trimmed to the last
+        # MAX_HISTORY_TURNS entries to bound token usage.
+        self.history: list = []
+        self.MAX_HISTORY_TURNS = 20
+
         # Retrieve the Gemini API key from environment variables
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
@@ -41,13 +47,21 @@ class MCPClient:
     async def connect_to_server(self, server_script_path: str):
         """Connect to the MCP server and list available tools."""
 
-        # Determine whether the server script is written in Python or JavaScript
-        # This allows us to execute the correct command to start the MCP server
-        command = "python" if server_script_path.endswith(".py") else "node"
+        if server_script_path.endswith(".py"):
+            # Prefer the server's own venv Python so it gets its own installed
+            # packages (e.g. google-auth-oauthlib, google-api-python-client).
+            # Falls back to this process's interpreter if no venv is found.
+            server_dir = os.path.dirname(os.path.abspath(server_script_path))
+            venv_python = os.path.join(server_dir, ".venv", "bin", "python")
+            command = venv_python if os.path.exists(venv_python) else sys.executable
+        else:
+            command = "node"
 
-        # Define the parameters for connecting to the MCP server
+        # Define the parameters for connecting to the MCP server.
+        # Pass --server_type stdio so the server communicates over stdin/stdout
+        # rather than starting an SSE/HTTP server.
         server_params = StdioServerParameters(
-            command=command, args=[server_script_path]
+            command=command, args=[server_script_path, "--server_type", "stdio"]
         )
 
         # Establish communication with the MCP server using standard input/output (stdio)
@@ -95,10 +109,14 @@ class MCPClient:
             ],  # Convert the text query into a Gemini-compatible format
         )
 
-        # Send user input to Gemini AI and include available tools for function calling
+        # Append the new user turn to persistent history so multi-turn chats
+        # have context. We send the full history with each request.
+        self.history.append(user_prompt_content)
+
+        # Send conversation history to Gemini with available tools
         response = self.genai_client.models.generate_content(
-            model="gemini-2.0-flash-001",  # Specifies which Gemini model to use
-            contents=[user_prompt_content],  # Send user input to Gemini
+            model="gemini-2.0-flash-lite",  # Specifies which Gemini model to use
+            contents=self.history,
             config=types.GenerateContentConfig(
                 tools=self.function_declarations,  # Pass the list of available MCP tools for Gemini to use
             ),
@@ -106,7 +124,6 @@ class MCPClient:
 
         # Initialize variables to store final response text and assistant messages
         final_text = []  # Stores the final formatted response
-        assistant_message_content = []  # Stores assistant responses
 
         # Process the response received from Gemini
         for candidate in response.candidates:
@@ -139,9 +156,14 @@ class MCPClient:
                                 result = await self.session.call_tool(
                                     tool_name, tool_args
                                 )  # Call MCP tool with arguments
-                                function_response = {
-                                    "result": result.content
-                                }  # Store the tool's output
+                                # result.content is a list of TextContent /
+                                # ImageContent objects. Extract plain text so
+                                # the response is JSON-serializable for Gemini.
+                                tool_output = "\n".join(
+                                    getattr(c, "text", str(c))
+                                    for c in (result.content or [])
+                                )
+                                function_response = {"result": tool_output}
                             except Exception as e:
                                 function_response = {
                                     "error": str(e)
@@ -161,26 +183,48 @@ class MCPClient:
                                 ],  # Attach the formatted response part
                             )
 
-                            # Send tool execution results back to Gemini for processing
+                            # Wrap the function-call Part in a Content object —
+                            # generate_content's `contents` list expects Content,
+                            # not raw Part objects.
+                            function_call_content = types.Content(
+                                role="model",
+                                parts=[function_call_part],
+                            )
+
+                            # Append the function-call and tool-response turns to
+                            # history so future queries can see them, then send
+                            # the full history back to Gemini.
+                            self.history.append(function_call_content)
+                            self.history.append(function_response_content)
+
                             response = self.genai_client.models.generate_content(
-                                model="gemini-2.0-flash-001",  # Use the same model
-                                contents=[
-                                    user_prompt_content,  # Include original user query
-                                    function_call_part,  # Include Gemini's function call request
-                                    function_response_content,  # Include tool execution result
-                                ],
+                                model="gemini-2.0-flash-lite",  # Use the same model
+                                contents=self.history,
                                 config=types.GenerateContentConfig(
                                     tools=self.function_declarations,  # Provide the available tools for continued use
                                 ),
                             )
 
                             # Extract final response text from Gemini after processing the tool call
-                            final_text.append(
-                                response.candidates[0].content.parts[0].text
-                            )
+                            follow_up = response.candidates[0].content
+                            for follow_part in follow_up.parts or []:
+                                if getattr(follow_part, "text", None):
+                                    final_text.append(follow_part.text)
+                            self.history.append(follow_up)
                         else:
                             # If no function call was requested, simply add Gemini's text response
                             final_text.append(part.text)
+                # Persist the model turn (text-only path) to history
+                if not any(
+                    getattr(p, "function_call", None)
+                    for p in (candidate.content.parts or [])
+                ):
+                    self.history.append(candidate.content)
+
+        # Bound history to the last MAX_HISTORY_TURNS Content entries so token
+        # usage stays predictable across long sessions.
+        if len(self.history) > self.MAX_HISTORY_TURNS:
+            self.history = self.history[-self.MAX_HISTORY_TURNS :]
 
         # Return the combined response as a single formatted string
         return "\n".join(final_text)
@@ -205,53 +249,47 @@ class MCPClient:
 
 def clean_schema(schema):
     """
-    Recursively removes 'title' fields from the JSON schema.
+    Recursively returns a copy of the JSON schema with 'title' fields removed.
 
-    Args:
-        schema (dict): The schema dictionary.
-
-    Returns:
-        dict: Cleaned schema without 'title' fields.
+    Pure function — does not mutate the input — so the original MCP tool
+    schemas remain intact for any other consumer.
     """
-    if isinstance(schema, dict):
-        schema.pop("title", None)  # Remove title if present
+    if not isinstance(schema, dict):
+        return schema
 
-        # Recursively clean nested properties
-        if "properties" in schema and isinstance(schema["properties"], dict):
-            for key in schema["properties"]:
-                schema["properties"][key] = clean_schema(schema["properties"][key])
-
-    return schema
+    cleaned = {k: v for k, v in schema.items() if k != "title"}
+    if isinstance(cleaned.get("properties"), dict):
+        cleaned["properties"] = {
+            k: clean_schema(v) for k, v in cleaned["properties"].items()
+        }
+    return cleaned
 
 
 def convert_mcp_tools_to_gemini(mcp_tools):
     """
     Converts MCP tool definitions to the correct format for Gemini API function calling.
 
+    Returns a single-element list containing one Tool that wraps every
+    FunctionDeclaration. Gemini expects all declarations grouped under one
+    Tool — passing one Tool per function is non-standard and can cause
+    unexpected behavior.
+
     Args:
         mcp_tools (list): List of MCP tool objects with 'name', 'description', and 'inputSchema'.
 
     Returns:
-        list: List of Gemini Tool objects with properly formatted function declarations.
+        list: [Tool(function_declarations=[...])]
     """
-    gemini_tools = []
-
-    for tool in mcp_tools:
-        # Ensure inputSchema is a valid JSON schema and clean it
-        parameters = clean_schema(tool.inputSchema)
-
-        # Construct the function declaration
-        function_declaration = FunctionDeclaration(
+    function_declarations = [
+        FunctionDeclaration(
             name=tool.name,
             description=tool.description,
-            parameters=parameters,  # Now correctly formatted
+            parameters=clean_schema(tool.inputSchema),
         )
+        for tool in mcp_tools
+    ]
 
-        # Wrap in a Tool object
-        gemini_tool = Tool(function_declarations=[function_declaration])
-        gemini_tools.append(gemini_tool)
-
-    return gemini_tools
+    return [Tool(function_declarations=function_declarations)]
 
 
 async def main():
